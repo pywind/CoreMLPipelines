@@ -12,7 +12,7 @@ struct ProfileCLI: AsyncParsableCommand {
     )
 
     func run() async throws {
-        let pipeline = try await TextGenerationPipeline(model: .llama_3_2_1B_Instruct_4bit)
+        let pipeline = try await TextGenerationPipeline(model: .lgai_exaone_4_0_1_2B_4bit)
         var messages: [[String: String]] = []
         messages.append([
             "role": "user",

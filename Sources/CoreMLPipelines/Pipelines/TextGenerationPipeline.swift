@@ -25,16 +25,25 @@ public class TextGenerationPipeline {
         prewarm: Bool = true,
         hubAPI: HubApi = .shared
     ) async throws {
-        let signposter = Signposter(category: String(describing: TextGenerationPipeline.self))
-        self.signposter = signposter
+        async let _tokenizer = try await AutoTokenizer.from(pretrained: modelName, hubApi: hubAPI)
+        async let _model = try await CausalLMModel.from(pretrained: modelName, hubAPI: hubAPI)
 
-        async let _tokenizer = signposter.measure("Tokenizer Load") {
-            try await AutoTokenizer.from(pretrained: modelName, hubApi: hubAPI)
-        }
+        (tokenizer, model) = try await (_tokenizer, _model)
+        kvCache = model.makeKVCache()
 
-        async let _model = signposter.measure("Model Load") {
-            try await CausalLMModel.from(pretrained: modelName, hubAPI: hubAPI)
-        }
+        sampler = GreedySampler()
+
+        if prewarm { try await self.prewarm() }
+    }
+
+    public init(
+        modelURL: URL,
+        tokenizerName: String,
+        prewarm: Bool = true,
+        hubAPI: HubApi = .shared
+    ) async throws {
+        async let _tokenizer = try await AutoTokenizer.from(pretrained: tokenizerName, hubApi: hubAPI)
+        async let _model = try await CausalLMModel.load(contentsOf: modelURL)
 
         (tokenizer, model) = try await (_tokenizer, _model)
         kvCache = model.makeKVCache()
@@ -47,13 +56,11 @@ public class TextGenerationPipeline {
     // MARK: Public
 
     public func prewarm() async throws {
-        _ = try await signposter.measure("Prewarm") {
-            try await model(
-                inputIDs: MLShapedArray<Int32>(repeating: 0, shape: [1, 2]),
-                causalMask: MLShapedArray<Float16>(repeating: 0, shape: [1, 1, 1, 2]),
-                kvCache: model.makeKVCache()
-            )
-        }
+        _ = try await model(
+            inputIDs: MLShapedArray<Int32>(repeating: 0, shape: [1, 2]),
+            causalMask: MLShapedArray<Float16>(repeating: 0, shape: [1, 1, 1, 2]),
+            kvCache: model.makeKVCache()
+        )
     }
 
     // TODO: - assert/check prompt starts with last prompt
@@ -104,8 +111,6 @@ public class TextGenerationPipeline {
     private let model: CausalLMModel
     private let sampler: Sampler
     private let kvCache: CausalLMModel.KVCache
-
-    private let signposter: Signposter
 }
 
 private extension TextGenerationPipeline {
@@ -123,24 +128,21 @@ private extension TextGenerationPipeline {
             let kvCache: CausalLMModel.KVCache
             let tokenizer: Tokenizer
             let sampler: Sampler
-            let signposter: Signposter
         }
         let modelContainer = ModelContainer(
             model: model,
             kvCache: kvCache,
             tokenizer: tokenizer,
-            sampler: sampler,
-            signposter: signposter
+            sampler: sampler
         )
         return AsyncThrowingStream<String, Error> { continuation in
             Task {
                 do {
-                    let (model, kvCache, tokenizer, sampler, signposter) = (
+                    let (model, kvCache, tokenizer, sampler) = (
                         modelContainer.model,
                         modelContainer.kvCache,
                         modelContainer.tokenizer,
-                        modelContainer.sampler,
-                        modelContainer.signposter
+                        modelContainer.sampler
                     )
                     var tokens: [Int] = []
                     var tokensGenerated = 0
@@ -154,9 +156,7 @@ private extension TextGenerationPipeline {
                         try Task.checkCancellation()
 
                         if tokens.isEmpty {
-                            let promptInterval = signposter.begin("Prompt")
-
-                            tokens = try signposter.measure("Tokenizer Encode") {
+                            tokens = try {
                                 switch prompt {
                                 case let .text(text):
                                     tokenizer.encode(text: text)
@@ -165,64 +165,46 @@ private extension TextGenerationPipeline {
                                         messages: messages
                                     )
                                 }
-                            }
-
-                            defer { promptInterval.end(metadata: tokens.count) }
+                            }()
 
                             let inputIDs = MLShapedArray(scalars: tokens.map(Int32.init), shape: [1, tokens.count])
 
-                            let causalMask = await signposter.measure("Create Causal Mask") {
-                                await MLTensor.causalMask(size: tokens.count)
-                                    .shapedArray(of: Float16.self)
-                            }
+                            let causalMask = await MLTensor.causalMask(size: tokens.count)
+                                .shapedArray(of: Float16.self)
 
-                            let logits = try await signposter.measure("Prompt Prediction") {
-                                try await model(
-                                    inputIDs: inputIDs,
-                                    causalMask: causalMask,
-                                    kvCache: kvCache
-                                )
-                            }
+                            let logits = try await model(
+                                inputIDs: inputIDs,
+                                causalMask: causalMask,
+                                kvCache: kvCache
+                            )
 
-                            let predictedToken = await signposter.measure("Sampling") {
-                                await sampler.sample(logits[0, logits.shape[1] - 1])
-                            }
+                            let predictedToken = await sampler.sample(logits[0, logits.shape[1] - 1])
 
                             tokens.append(predictedToken)
                             tokensGenerated += 1
 
-                            let decodedText = signposter.measure("Tokenizer Decode") {
-                                tokenizer.decode(tokens: [predictedToken], skipSpecialTokens: true)
-                            }
+                            let decodedText = tokenizer.decode(tokens: [predictedToken], skipSpecialTokens: true)
                             continuation.yield(decodedText)
                         } else {
-                            try await signposter.measure("Extend") {
-                                let inputIDs = MLShapedArray(scalars: [Int32(tokens.last!)], shape: [1, 1])
-                                let causalMask = MLShapedArray<Float16>(
-                                    repeating: 0,
-                                    shape: [1, 1, 1, tokens.count]
-                                )
+                            let inputIDs = MLShapedArray(scalars: [Int32(tokens.last!)], shape: [1, 1])
+                            let causalMask = MLShapedArray<Float16>(
+                                repeating: 0,
+                                shape: [1, 1, 1, tokens.count]
+                            )
 
-                                let logits = try await signposter.measure("Extend Prediction") {
-                                    try await model(
-                                        inputIDs: inputIDs,
-                                        causalMask: causalMask,
-                                        kvCache: kvCache
-                                    )
-                                }
+                            let logits = try await model(
+                                inputIDs: inputIDs,
+                                causalMask: causalMask,
+                                kvCache: kvCache
+                            )
 
-                                let predictedToken = await signposter.measure("Sampling") {
-                                    await sampler.sample(logits[0, logits.shape[1] - 1])
-                                }
+                            let predictedToken = await sampler.sample(logits[0, logits.shape[1] - 1])
 
-                                tokens.append(predictedToken)
-                                tokensGenerated += 1
+                            tokens.append(predictedToken)
+                            tokensGenerated += 1
 
-                                let decodedText = signposter.measure("Tokenizer Decode") {
-                                    tokenizer.decode(tokens: [predictedToken], skipSpecialTokens: true)
-                                }
-                                continuation.yield(decodedText)
-                            }
+                            let decodedText = tokenizer.decode(tokens: [predictedToken], skipSpecialTokens: true)
+                            continuation.yield(decodedText)
                         }
                     }
                 } catch {

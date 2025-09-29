@@ -3,7 +3,7 @@ from transformers.models.auto import AutoModelForCausalLM, AutoConfig
 import coremltools as ct
 import numpy as np
 from typing import Any, Optional, Sequence
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from argparse import ArgumentParser
 import subprocess
 from huggingface_hub import (
@@ -14,8 +14,10 @@ from huggingface_hub import (
     whoami,
     ModelCard,
     ModelCardData,
+    login,
 )
 import os
+from dotenv import load_dotenv
 
 
 def log(text):
@@ -23,7 +25,7 @@ def log(text):
 
 
 parser = ArgumentParser(
-    prog="CausalLM.py", description="Convert a Causal LM to Core ML model"
+    prog="convert_causal_llm.py", description="Convert a Causal LM to Core ML model"
 )
 parser.add_argument(
     "--model", type=str, default="meta-llama/Llama-3.2-1B-Instruct", help="Model ID"
@@ -47,6 +49,17 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Login to HuggingFace if token is available
+hf_token = os.getenv("HF_TOKEN")
+if hf_token:
+    login(token=hf_token)
+    log("Logged in to HuggingFace")
+else:
+    log("Warning: HF_TOKEN not found in environment variables. Upload will fail if not already authenticated.")
+
 
 class KVCache(Cache):
     def __init__(
@@ -55,7 +68,8 @@ class KVCache(Cache):
         shape: Sequence[int],
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        super().__init__()
+        # 
+        super().__init__(layer_class_to_replicate=DynamicCache)
         self.past_seen_tokens: int = 0
         self.k: torch.Tensor = torch.zeros(shape, dtype=dtype)
         self.v: torch.Tensor = torch.zeros(shape, dtype=dtype)
@@ -79,6 +93,12 @@ class KVCache(Cache):
     def get_seq_length(self, _: int = 0) -> int:
         return self.past_seen_tokens
 
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+        """Return (kv_length, kv_offset) for mask creation."""
+        kv_length = self.past_seen_tokens + cache_position.shape[-1]
+        kv_offset = 0  # No offset in our simple implementation
+        return kv_length, kv_offset
+
 
 class Model(torch.nn.Module):
     def __init__(
@@ -91,7 +111,7 @@ class Model(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, low_cpu_mem_usage=True
+            model_path, dtype=dtype, low_cpu_mem_usage=True
         )
         config: AutoConfig = self.model.config
         self.kv_cache_shape: tuple[int, ...] = (

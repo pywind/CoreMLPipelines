@@ -12,15 +12,27 @@ struct ChatCLI: AsyncParsableCommand {
         abstract: "Chat using CoreMLPipelines"
     )
 
-    @Option var model: String = TextGenerationPipeline.Model.llama_3_2_1B_Instruct_4bit.rawValue
+    @Option var model: String = TextGenerationPipeline.Model.lgai_exaone_4_0_1_2B_4bit.rawValue
+    @Option var local: String?
 
     func run() async throws {
         ActivityIndicator.start(title: "Loading \(model.brightGreen)…")
-        let pipeline = try await TextGenerationPipeline(modelName: model)
+        let pipeline: TextGenerationPipeline
+        if let localPath = local {
+            let modelURL = URL(fileURLWithPath: localPath)
+            pipeline = try await TextGenerationPipeline(modelURL: modelURL, tokenizerName: model)
+        } else {
+            pipeline = try await TextGenerationPipeline(modelName: model)
+        }
         ActivityIndicator.stop()
         CommandLine.success("Model loaded!")
 
-        var messages: [[String: String]] = []
+        var messages: [[String: String]] = [
+            [
+                "role": "system",
+                "content": "You are a helpful assistant."
+            ]
+        ]
         while true {
             let prompt = CommandLine.askForText()
             guard prompt.localizedCaseInsensitiveCompare("exit") != .orderedSame,
